@@ -7014,6 +7014,8 @@ fn request_ends_with_tool_result(request: &ApiRequest) -> bool {
 fn format_user_visible_api_error(session_id: &str, error: &api::ApiError) -> String {
     if error.is_context_window_failure() {
         format_context_window_blocked_error(session_id, error)
+    } else if error.is_model_access_denied() {
+        format_model_access_denied_error(session_id, error)
     } else if error.is_generic_fatal_wrapper() {
         let mut qualifiers = vec![format!("session {session_id}")];
         if let Some(request_id) = error.request_id() {
@@ -7098,6 +7100,64 @@ fn format_context_window_blocked_error(session_id: &str, error: &api::ApiError) 
             .to_string(),
     );
     lines.push("  Retry            rerun after compacting or reducing the request".to_string());
+
+    lines.join("\n")
+}
+
+fn format_model_access_denied_error(session_id: &str, error: &api::ApiError) -> String {
+    let mut lines = vec![
+        "Model access denied".to_string(),
+        "  Failure class    model_access_denied".to_string(),
+        format!("  Session          {session_id}"),
+    ];
+
+    if let Some(request_id) = error.request_id() {
+        lines.push(format!("  Trace            {request_id}"));
+    }
+
+    let detail = match error {
+        api::ApiError::Api { message, body, .. } => {
+            message.as_deref().unwrap_or(body).trim().to_string()
+        }
+        api::ApiError::RetriesExhausted { last_error, .. } => match last_error.as_ref() {
+            api::ApiError::Api { message, body, .. } => {
+                message.as_deref().unwrap_or(body).trim().to_string()
+            }
+            _ => String::new(),
+        },
+        _ => String::new(),
+    };
+
+    if !detail.is_empty() {
+        lines.push(format!(
+            "  Detail           {}",
+            truncate_for_summary(&detail, 160)
+        ));
+    }
+
+    lines.push(String::new());
+    lines.push(
+        "The selected model requires a higher subscription tier (e.g. Claude Pro Max,".to_string(),
+    );
+    lines.push(
+        "Teams, or Enterprise). Claude Opus is not included in the free or standard Pro plan."
+            .to_string(),
+    );
+    lines.push(String::new());
+    lines.push("Options".to_string());
+    lines.push(
+        "  Switch model     claw --model sonnet  (Claude Sonnet — included in Pro)".to_string(),
+    );
+    lines.push(
+        "  Switch model     claw --model haiku   (Claude Haiku — fastest, lowest cost)".to_string(),
+    );
+    lines.push(
+        "  Upgrade plan     https://claude.ai/upgrade  (Claude Pro Max includes Opus)".to_string(),
+    );
+    lines.push(
+        "  Set default      add  { \"model\": \"sonnet\" }  to your ~/.claw/settings.json"
+            .to_string(),
+    );
 
     lines.join("\n")
 }
@@ -8489,6 +8549,39 @@ mod tests {
             rendered.contains("Resume compact   claw --resume session-issue-32 /compact"),
             "{rendered}"
         );
+    }
+
+    #[test]
+    fn model_access_denied_renders_upgrade_guidance() {
+        let error = ApiError::Api {
+            status: "403".parse().expect("status"),
+            error_type: Some("permission_error".to_string()),
+            message: Some(
+                "Your account does not have access to the claude-opus-4-6 model. \
+                 Please upgrade your subscription to access this model."
+                    .to_string(),
+            ),
+            request_id: Some("req_upgrade_001".to_string()),
+            body: String::new(),
+            retryable: false,
+        };
+
+        let rendered = format_user_visible_api_error("session-opus-vscode", &error);
+        assert!(rendered.contains("Model access denied"), "{rendered}");
+        assert!(rendered.contains("model_access_denied"), "{rendered}");
+        assert!(
+            rendered.contains("Session          session-opus-vscode"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("Trace            req_upgrade_001"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("higher subscription tier"), "{rendered}");
+        assert!(rendered.contains("--model sonnet"), "{rendered}");
+        assert!(rendered.contains("--model haiku"), "{rendered}");
+        assert!(rendered.contains("claude.ai/upgrade"), "{rendered}");
+        assert!(rendered.contains("settings.json"), "{rendered}");
     }
 
     fn temp_dir() -> PathBuf {

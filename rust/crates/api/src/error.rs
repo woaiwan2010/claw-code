@@ -17,6 +17,19 @@ const CONTEXT_WINDOW_ERROR_MARKERS: &[&str] = &[
     "request is too large",
 ];
 
+/// Markers in 403 API responses that indicate the user's subscription plan
+/// does not include access to the requested model (e.g. Opus requires Pro Max).
+const MODEL_ACCESS_DENIED_MARKERS: &[&str] = &[
+    "upgrade",
+    "subscription",
+    "your plan",
+    "access to this model",
+    "not have access",
+    "requires a",
+    "higher tier",
+    "permission",
+];
+
 #[derive(Debug)]
 pub enum ApiError {
     MissingCredentials {
@@ -162,6 +175,7 @@ impl ApiError {
             Self::MissingCredentials { .. } | Self::ExpiredOAuthToken | Self::Auth(_) => {
                 "provider_auth"
             }
+            Self::Api { .. } if self.is_model_access_denied() => "model_access_denied",
             Self::Api { status, .. } if matches!(status.as_u16(), 401 | 403) => "provider_auth",
             Self::ContextWindowExceeded { .. } => "context_window",
             Self::Api { .. } if self.is_context_window_failure() => "context_window",
@@ -216,6 +230,44 @@ impl ApiError {
             }
             Self::RetriesExhausted { last_error, .. } => last_error.is_context_window_failure(),
             Self::MissingCredentials { .. }
+            | Self::ExpiredOAuthToken
+            | Self::Auth(_)
+            | Self::InvalidApiKeyEnv(_)
+            | Self::Http(_)
+            | Self::Io(_)
+            | Self::Json { .. }
+            | Self::InvalidSseFrame(_)
+            | Self::BackoffOverflow { .. } => false,
+        }
+    }
+
+    /// Returns `true` when the API refused the request because the user's
+    /// subscription plan does not include access to the requested model
+    /// (e.g. Claude Opus requires a Pro Max / Teams / Enterprise plan).
+    /// Detected as a 403 whose `error_type` is `"permission_error"` *and*
+    /// whose message or body contains at least one model-access marker.
+    #[must_use]
+    pub fn is_model_access_denied(&self) -> bool {
+        match self {
+            Self::Api {
+                status,
+                error_type,
+                message,
+                body,
+                ..
+            } => {
+                status.as_u16() == 403
+                    && error_type
+                        .as_deref()
+                        .is_some_and(|t| t.eq_ignore_ascii_case("permission_error"))
+                    && (message
+                        .as_deref()
+                        .is_some_and(looks_like_model_access_denied)
+                        || looks_like_model_access_denied(body))
+            }
+            Self::RetriesExhausted { last_error, .. } => last_error.is_model_access_denied(),
+            Self::MissingCredentials { .. }
+            | Self::ContextWindowExceeded { .. }
             | Self::ExpiredOAuthToken
             | Self::Auth(_)
             | Self::InvalidApiKeyEnv(_)
@@ -369,6 +421,13 @@ fn looks_like_generic_fatal_wrapper(text: &str) -> bool {
 fn looks_like_context_window_error(text: &str) -> bool {
     let lowered = text.to_ascii_lowercase();
     CONTEXT_WINDOW_ERROR_MARKERS
+        .iter()
+        .any(|marker| lowered.contains(marker))
+}
+
+fn looks_like_model_access_denied(text: &str) -> bool {
+    let lowered = text.to_ascii_lowercase();
+    MODEL_ACCESS_DENIED_MARKERS
         .iter()
         .any(|marker| lowered.contains(marker))
 }
@@ -568,5 +627,84 @@ mod tests {
         assert_eq!(error.safe_failure_class(), "provider_auth");
         assert!(!error.is_retryable());
         assert_eq!(error.request_id(), None);
+    }
+
+    #[test]
+    fn detects_model_access_denied_and_classifies_it_correctly() {
+        let error = ApiError::Api {
+            status: reqwest::StatusCode::FORBIDDEN,
+            error_type: Some("permission_error".to_string()),
+            message: Some(
+                "Your account does not have access to the claude-opus-4-6 model. \
+                 Please upgrade your subscription to access this model."
+                    .to_string(),
+            ),
+            request_id: Some("req_upgrade_789".to_string()),
+            body: String::new(),
+            retryable: false,
+        };
+
+        assert!(
+            error.is_model_access_denied(),
+            "permission_error 403 with upgrade text should be model_access_denied"
+        );
+        assert_eq!(error.safe_failure_class(), "model_access_denied");
+        assert!(!error.is_generic_fatal_wrapper());
+        assert!(!error.is_context_window_failure());
+        assert_eq!(error.request_id(), Some("req_upgrade_789"));
+    }
+
+    #[test]
+    fn non_permission_error_403_is_not_model_access_denied() {
+        let error = ApiError::Api {
+            status: reqwest::StatusCode::FORBIDDEN,
+            error_type: Some("authentication_error".to_string()),
+            message: Some("Invalid API key.".to_string()),
+            request_id: None,
+            body: String::new(),
+            retryable: false,
+        };
+
+        assert!(
+            !error.is_model_access_denied(),
+            "authentication_error 403 should not be classified as model_access_denied"
+        );
+        assert_eq!(error.safe_failure_class(), "provider_auth");
+    }
+
+    #[test]
+    fn model_access_denied_detected_via_body_when_message_absent() {
+        let error = ApiError::Api {
+            status: reqwest::StatusCode::FORBIDDEN,
+            error_type: Some("permission_error".to_string()),
+            message: None,
+            request_id: None,
+            body: r#"{"type":"error","error":{"type":"permission_error","message":"Your plan does not include access to this model."}}"#.to_string(),
+            retryable: false,
+        };
+
+        assert!(
+            error.is_model_access_denied(),
+            "permission_error 403 with access-denial keywords in body should be detected"
+        );
+        assert_eq!(error.safe_failure_class(), "model_access_denied");
+    }
+
+    #[test]
+    fn retries_exhausted_propagates_model_access_denied() {
+        let error = ApiError::RetriesExhausted {
+            attempts: 2,
+            last_error: Box::new(ApiError::Api {
+                status: reqwest::StatusCode::FORBIDDEN,
+                error_type: Some("permission_error".to_string()),
+                message: Some("Upgrade required to access this model.".to_string()),
+                request_id: None,
+                body: String::new(),
+                retryable: false,
+            }),
+        };
+
+        assert!(error.is_model_access_denied());
+        assert_eq!(error.safe_failure_class(), "model_access_denied");
     }
 }
